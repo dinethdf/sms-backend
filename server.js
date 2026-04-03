@@ -35,7 +35,7 @@ let dbUsers = {}; // Stores Clinic User Accounts mapping (username -> User Objec
 const authenticateToken = (req, res, next) => {
     const authHeader = req.headers['authorization'];
     const token = authHeader && authHeader.split(' ')[1]; // Extract from "Bearer <token>"
-    
+
     if (token == null) return res.status(401).json({ error: "Unauthorized: Token missing" });
 
     jwt.verify(token, JWT_SECRET, (err, user) => {
@@ -55,7 +55,7 @@ app.post('/api/auth/register', async (req, res) => {
     if (!username || !password) {
         return res.status(400).json({ error: 'Username and password are required' });
     }
-    
+
     if (dbUsers[username]) {
         return res.status(400).json({ error: 'Username already exists' });
     }
@@ -72,7 +72,7 @@ app.post('/api/auth/register', async (req, res) => {
     };
 
     console.log(`\n[👤 REGISTER] New Clinic: ${username} -> ${clinicId}`);
-    
+
     res.status(201).json({ message: "Registration successful", clinicId });
 });
 
@@ -143,12 +143,12 @@ app.post('/trigger', authenticateToken, async (req, res) => {
     };
 
     try {
-        if(admin.apps.length > 0) {
+        if (admin.apps.length > 0) {
             await admin.messaging().send(payload);
             console.log(`\n[🚀 PUSHED] ${messageId} -> ${number} via SIM ${targetSimSlot + 1} (Triggered by ${req.user.username})`);
             res.json({ status: 'Success', messageId });
         } else {
-             res.status(500).json({ error: "Firebase Admin is not configured. Cannot push." });
+            res.status(500).json({ error: "Firebase Admin is not configured. Cannot push." });
         }
     } catch (error) {
         console.error(`\n[❌ FIREBASE ERROR]`, error.message);
