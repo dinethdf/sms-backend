@@ -1,4 +1,4 @@
-require('dotenv').config();
+require('dotenv').config(); // Added to load variables locally
 const express = require('express');
 const cors = require('cors');
 const admin = require('firebase-admin');
@@ -7,44 +7,121 @@ const { v4: uuidv4 } = require('uuid');
 const bcrypt = require('bcryptjs');
 const mongoose = require('mongoose');
 
-// Mongoose Models
-const User = require('./models/User');
-const Contact = require('./models/Contact');
-
-// Constants
-const JWT_SECRET = process.env.JWT_SECRET || "fallback_secret";
-const PORT = process.env.PORT || 3080;
+// ==========================================
+// 1. ENVIRONMENT CONFIGURATION
+// ==========================================
 const MONGODB_URI = process.env.MONGODB_URI;
+const JWT_SECRET = process.env.JWT_SECRET;
+const PORT = process.env.PORT || 3080;
 
-// 1. Initialize MongoDB
-if (MONGODB_URI) {
-    mongoose.connect(MONGODB_URI)
-        .then(() => console.log('✅ Connected to MongoDB Atlas'))
-        .catch(err => console.error('❌ MongoDB Connection Error:', err));
-} else {
-    console.error('❌ MONGODB_URI is missing from .env');
+// ==========================================
+// 2. VERCEL-PROOF MONGODB CACHE
+// ==========================================
+// This stops Vercel from opening 100+ connections and crashing MongoDB
+let cachedDb = global.mongoose;
+if (!cachedDb) {
+    cachedDb = global.mongoose = { conn: null, promise: null };
 }
 
-// 2. Initialize Firebase Admin
-let serviceAccount;
+async function connectDB() {
+    if (cachedDb.conn) return cachedDb.conn;
+
+    if (!cachedDb.promise) {
+        cachedDb.promise = mongoose.connect(MONGODB_URI, {
+            serverSelectionTimeoutMS: 15000,
+            socketTimeoutMS: 45000,
+        }).then((mongoose) => {
+            console.log('✅ Global MongoDB Connected Successfully!');
+            return mongoose;
+        }).catch(err => {
+            console.error('❌ MONGODB CONNECTION FATAL ERROR:', err.message);
+            cachedDb.promise = null; // reset if it fails
+            throw err;
+        });
+    }
+
+    cachedDb.conn = await cachedDb.promise;
+    return cachedDb.conn;
+}
+
+// ==========================================
+// 3. INITIALIZE FIREBASE
+// ==========================================
+let rawPrivateKey = process.env.FIREBASE_PRIVATE_KEY;
+
+// MAGIC FIX: If the key exists, force the \n characters to become real line breaks
+if (rawPrivateKey) {
+    // This Regex looks for literal \n and replaces it with an actual newline
+    // It also removes any accidental quotes you might have pasted
+    rawPrivateKey = rawPrivateKey.replace(/\\n/g, '\n').replace(/"/g, '');
+}
+
+const serviceAccount = {
+    "type": "service_account",
+    "project_id": process.env.FIREBASE_PROJECT_ID,
+    "private_key_id": process.env.FIREBASE_PRIVATE_KEY_ID,
+    "private_key": rawPrivateKey,
+    "client_email": process.env.FIREBASE_CLIENT_EMAIL,
+    "client_id": process.env.FIREBASE_CLIENT_ID,
+    "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+    "token_uri": "https://oauth2.googleapis.com/token",
+    "auth_provider_x509_cert_url": "https://www.googleapis.com/oauth2/v1/certs",
+    "client_x509_cert_url": process.env.FIREBASE_CLIENT_CERT_URL,
+    "universe_domain": "googleapis.com"
+};
+
 try {
-    serviceAccount = require('./firebase-key.json');
-    admin.initializeApp({
-        credential: admin.credential.cert(serviceAccount)
-    });
+    if (!admin.apps.length) {
+        admin.initializeApp({
+            credential: admin.credential.cert(serviceAccount)
+        });
+        console.log('✅ Firebase Admin connected successfully!');
+    }
 } catch (e) {
-    console.error("Firebase key missing or invalid, proceeding without notifications.");
+    console.error("❌ Firebase initialization error:", e.message);
 }
 
 const app = express();
 app.use(cors());
 app.use(express.json());
 
-// IN-MEMORY DEVICE STATE
-let registeredClinics = {}; // Stores Firebase FCM tokens mapping (clinicId -> Android Device FCM token)
+// ==========================================
+// 4. VERCEL DB MIDDLEWARE
+// ==========================================
+// This forces Express to verify the DB is connected before answering any route
+app.use(async (req, res, next) => {
+    try {
+        await connectDB();
+        next();
+    } catch (error) {
+        res.status(500).json({ error: "Database connection failed" });
+    }
+});
 
+// IN-MEMORY DEVICE STATE (FCM Tokens)
+let registeredClinics = {};
 
-// --- MIDDLEWARE: JWT Auth ---
+// ==========================================
+// 5. DATABASE MODELS
+// ==========================================
+const userSchema = new mongoose.Schema({
+    username: { type: String, required: true, unique: true },
+    password: { type: String, required: true },
+    clinicId: { type: String, required: true }
+});
+const User = mongoose.models.User || mongoose.model('User', userSchema);
+
+const contactSchema = new mongoose.Schema({
+    clinicId: { type: String, required: true },
+    name: { type: String, required: true },
+    number: { type: String, required: true },
+    category: { type: String, default: 'General' }
+});
+const Contact = mongoose.models.Contact || mongoose.model('Contact', contactSchema);
+
+// ==========================================
+// 6. AUTH MIDDLEWARE
+// ==========================================
 const authenticateToken = (req, res, next) => {
     const authHeader = req.headers['authorization'];
     const token = authHeader && authHeader.split(' ')[1];
@@ -58,12 +135,11 @@ const authenticateToken = (req, res, next) => {
     });
 };
 
-
-// --- ENDPOINTS: AUTHENTICATION ---
-
+// ==========================================
+// 7. AUTHENTICATION ENDPOINTS
+// ==========================================
 app.post('/api/auth/register', async (req, res) => {
     const { username, password } = req.body;
-
     if (!username || !password) return res.status(400).json({ error: 'Username and password are required' });
 
     try {
@@ -73,11 +149,7 @@ app.post('/api/auth/register', async (req, res) => {
         const clinicId = "clinic_" + uuidv4();
         const hashedPassword = await bcrypt.hash(password, 10);
 
-        const newUser = new User({
-            username,
-            password: hashedPassword,
-            clinicId
-        });
+        const newUser = new User({ username, password: hashedPassword, clinicId });
         await newUser.save();
 
         console.log(`\n[👤 REGISTER DB] New Clinic: ${username} -> ${clinicId}`);
@@ -106,17 +178,14 @@ app.post('/api/auth/login', async (req, res) => {
     }
 });
 
-
-// --- ENDPOINTS: CONTACTS MANAGEMENT ---
-
+// ==========================================
+// 8. CONTACTS ENDPOINTS (Protected)
+// ==========================================
 app.post('/api/contacts', authenticateToken, async (req, res) => {
     const { name, number, category } = req.body;
     try {
         const contact = new Contact({
-            clinicId: req.user.clinicId,
-            name,
-            number,
-            category: category || 'General'
+            clinicId: req.user.clinicId, name, number, category: category || 'General'
         });
         await contact.save();
         res.status(201).json(contact);
@@ -143,9 +212,9 @@ app.get('/api/contacts/categories', authenticateToken, async (req, res) => {
     }
 });
 
-
-// --- ENDPOINTS: MOBILE APP REGISTRATION ---
-
+// ==========================================
+// 9. SMS GATEWAY ENDPOINTS
+// ==========================================
 app.post('/register', (req, res) => {
     const { clinicId, token } = req.body;
     if (!clinicId || !token) return res.status(400).send('Error: Missing clinicId or token');
@@ -155,9 +224,6 @@ app.post('/register', (req, res) => {
     res.send('Phone registered successfully!');
 });
 
-
-// --- ENDPOINTS: WEB APP SMS DISPATCHER (PROTECTED) ---
-
 app.post('/trigger', authenticateToken, async (req, res) => {
     const { number, message, sim } = req.body;
     const clinicId = req.user.clinicId;
@@ -165,20 +231,14 @@ app.post('/trigger', authenticateToken, async (req, res) => {
     if (!number || !message) return res.status(400).json({ error: 'Missing number or message' });
 
     const targetToken = registeredClinics[clinicId];
-    if (!targetToken) return res.status(404).json({ error: `Not connected` });
+    if (!targetToken) return res.status(404).json({ error: `No Android connected for ${clinicId}` });
 
     const messageId = "MSG-" + Date.now();
     const targetSimSlot = sim === '2' ? 1 : 0;
 
     const payload = {
         token: targetToken,
-        data: {
-            id: String(messageId),
-            type: "single",
-            number: String(number),
-            message: String(message),
-            simSlot: String(targetSimSlot)
-        }
+        data: { id: String(messageId), type: "single", number: String(number), message: String(message), simSlot: String(targetSimSlot) }
     };
 
     try {
@@ -207,9 +267,7 @@ app.post('/trigger-bulk', authenticateToken, async (req, res) => {
 
     try {
         const contacts = await Contact.find(filter);
-        if (!contacts || contacts.length === 0) {
-            return res.status(400).json({ error: "No contacts found for this category" });
-        }
+        if (!contacts || contacts.length === 0) return res.status(400).json({ error: "No contacts found for this category" });
 
         const numbers = contacts.map(c => c.number);
         const messageId = "BULK-" + Date.now();
@@ -217,13 +275,7 @@ app.post('/trigger-bulk', authenticateToken, async (req, res) => {
 
         const payload = {
             token: targetToken,
-            data: {
-                id: String(messageId),
-                type: "bulk",
-                numbers: JSON.stringify(numbers), // Parse securely back on Mobile array
-                message: String(message),
-                simSlot: String(targetSimSlot)
-            }
+            data: { id: String(messageId), type: "bulk", numbers: JSON.stringify(numbers), message: String(message), simSlot: String(targetSimSlot) }
         };
 
         if (admin.apps.length > 0) {
@@ -238,9 +290,6 @@ app.post('/trigger-bulk', authenticateToken, async (req, res) => {
     }
 });
 
-
-// --- ENDPOINTS: MOBILE FEEDBACK REPORTS ---
-
 app.post('/status', (req, res) => {
     const { id, status, androidResponse } = req.body;
     if (status === 'SUCCESS') {
@@ -251,9 +300,18 @@ app.post('/status', (req, res) => {
     res.send('Status logged');
 });
 
+// ==========================================
+// 10. START / EXPORT FOR VERCEL
+// ==========================================
+// This checks if we are running locally or on Vercel.
+// Vercel requires us to EXPORT the app, local requires us to LISTEN.
+if (require.main === module) {
+    app.listen(PORT, '0.0.0.0', () => {
+        console.log('================================================');
+        console.log(`🚀 MONGO-DB + FULL-AUTH SMS GATEWAY ON PORT ${PORT}`);
+        console.log('================================================');
+    });
+}
 
-app.listen(PORT, '0.0.0.0', () => {
-    console.log('================================================');
-    console.log(`🚀 MONGO-DB + FULL-AUTH SMS GATEWAY ON PORT ${PORT}`);
-    console.log('================================================');
-});
+// Export for Vercel Serverless
+module.exports = app;
