@@ -119,6 +119,8 @@ const contactSchema = new mongoose.Schema({
 });
 const Contact = mongoose.models.Contact || mongoose.model('Contact', contactSchema);
 
+const SmsLog = require('./models/SmsLog');
+
 // ==========================================
 // 6. AUTH MIDDLEWARE
 // ==========================================
@@ -215,9 +217,10 @@ app.get('/api/contacts/categories', authenticateToken, async (req, res) => {
 // ==========================================
 // 9. SMS GATEWAY ENDPOINTS
 // ==========================================
-app.post('/register', (req, res) => {
-    const { clinicId, token } = req.body;
-    if (!clinicId || !token) return res.status(400).send('Error: Missing clinicId or token');
+app.post('/register', authenticateToken, (req, res) => {
+    const clinicId = req.user.clinicId;
+    const { token } = req.body;
+    if (!token) return res.status(400).send('Error: Missing token');
 
     registeredClinics[clinicId] = token;
     console.log(`\n[🔗 CONNECTED] Phone linked to Clinic: ${clinicId}`);
@@ -243,6 +246,16 @@ app.post('/trigger', authenticateToken, async (req, res) => {
 
     try {
         if (admin.apps.length > 0) {
+            await SmsLog.create({
+                messageId: String(messageId),
+                clinicId,
+                type: 'single',
+                recipient: String(number),
+                messageContent: String(message),
+                simSlot: String(targetSimSlot),
+                status: 'PENDING'
+            });
+
             await admin.messaging().send(payload);
             res.json({ status: 'Success', messageId });
         } else {
@@ -279,6 +292,17 @@ app.post('/trigger-bulk', authenticateToken, async (req, res) => {
         };
 
         if (admin.apps.length > 0) {
+            const logs = numbers.map(num => ({
+                messageId: `${messageId}-${num}`,
+                clinicId,
+                type: 'bulk',
+                recipient: num,
+                messageContent: message,
+                simSlot: String(targetSimSlot),
+                status: 'PENDING'
+            }));
+            await SmsLog.insertMany(logs);
+
             await admin.messaging().send(payload);
             console.log(`\n[🚀 PUSHED BULK] ${numbers.length} messages -> Android Queue`);
             res.json({ status: 'Success', messageId, count: numbers.length });
@@ -290,14 +314,74 @@ app.post('/trigger-bulk', authenticateToken, async (req, res) => {
     }
 });
 
-app.post('/status', (req, res) => {
+app.post('/status', authenticateToken, async (req, res) => {
     const { id, status, androidResponse } = req.body;
+    try {
+        await SmsLog.findOneAndUpdate(
+            { messageId: id },
+            { 
+               status: status === 'SUCCESS' ? 'SUCCESS' : 'FAILED', 
+               errorMessage: status === 'SUCCESS' ? '' : String(androidResponse) 
+            }
+        );
+    } catch(e) {
+        console.error("Error updating log:", e.message);
+    }
+
     if (status === 'SUCCESS') {
         console.log(`[✅ DELIVERED] [${id}]: "${androidResponse}"`);
     } else {
         console.log(`[❌ FAILED] [${id}]: "${androidResponse}"`);
     }
     res.send('Status logged');
+});
+
+app.get('/api/sms/history', authenticateToken, async (req, res) => {
+    try {
+        const logs = await SmsLog.find({ clinicId: req.user.clinicId }).sort({ createdAt: -1 });
+        const totalSent = logs.length;
+        const totalFailed = logs.filter(l => l.status === 'FAILED').length;
+        res.json({ logs, summary: { totalSent, totalFailed } });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+app.post('/api/sms/resend', authenticateToken, async (req, res) => {
+    const { messageId } = req.body;
+    const clinicId = req.user.clinicId;
+
+    try {
+        const log = await SmsLog.findOne({ messageId, clinicId });
+        if (!log) return res.status(404).json({ error: "No log found for this ID." });
+
+        const targetToken = registeredClinics[clinicId];
+        if (!targetToken) return res.status(404).json({ error: "Your Android device is not linked." });
+
+        const payload = {
+            token: targetToken,
+            data: { 
+                id: String(log.messageId), 
+                type: log.type === 'bulk' ? 'bulk' : 'single', 
+                number: String(log.recipient), 
+                message: String(log.messageContent), 
+                simSlot: String(log.simSlot || '0') 
+            }
+        };
+
+        if (log.type === 'bulk') {
+            payload.data.numbers = JSON.stringify([log.recipient]);
+            payload.data.type = "single"; // Resending a single line from a bulk set as a single trigger
+        }
+
+        await SmsLog.updateOne({ messageId: log.messageId }, { status: 'PENDING', errorMessage: '' });
+        await admin.messaging().send(payload);
+
+        console.log(`\n[🔄 RESENT] ${log.recipient} -> Target Mobile`);
+        res.json({ message: "Resend triggered successfully!" });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
 });
 
 // ==========================================
