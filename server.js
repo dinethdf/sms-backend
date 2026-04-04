@@ -315,24 +315,36 @@ app.post('/trigger-bulk', authenticateToken, async (req, res) => {
 });
 
 app.post('/status', authenticateToken, async (req, res) => {
-    const { id, status, androidResponse } = req.body;
-    try {
-        await SmsLog.findOneAndUpdate(
-            { messageId: id },
-            { 
-               status: status === 'SUCCESS' ? 'SUCCESS' : 'FAILED', 
-               errorMessage: status === 'SUCCESS' ? '' : String(androidResponse) 
+    const { id, status, androidResponse, reports, isBatch } = req.body;
+    
+    const updateLog = async (msgId, msgStatus, response) => {
+        try {
+            await SmsLog.findOneAndUpdate(
+                { messageId: msgId },
+                { 
+                   status: msgStatus === 'SUCCESS' ? 'SUCCESS' : 'FAILED', 
+                   errorMessage: msgStatus === 'SUCCESS' ? '' : String(response) 
+                }
+            );
+            if (msgStatus === 'SUCCESS') {
+                console.log(`[✅ DELIVERED] [${msgId}]: "${response}"`);
+            } else {
+                console.log(`[❌ FAILED] [${msgId}]: "${response}"`);
             }
-        );
-    } catch(e) {
-        console.error("Error updating log:", e.message);
+        } catch(e) {
+            console.error("Error updating log:", e.message);
+        }
+    };
+
+    if (isBatch && Array.isArray(reports)) {
+        console.log(`\n[📥 BATCH STATUS] Received ${reports.length} offline reports.`);
+        for (const report of reports) {
+            await updateLog(report.id, report.status, report.androidResponse);
+        }
+    } else {
+        await updateLog(id, status, androidResponse);
     }
 
-    if (status === 'SUCCESS') {
-        console.log(`[✅ DELIVERED] [${id}]: "${androidResponse}"`);
-    } else {
-        console.log(`[❌ FAILED] [${id}]: "${androidResponse}"`);
-    }
     res.send('Status logged');
 });
 
