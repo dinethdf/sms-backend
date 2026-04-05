@@ -6,6 +6,8 @@ const jwt = require('jsonwebtoken');
 const { v4: uuidv4 } = require('uuid');
 const bcrypt = require('bcryptjs');
 const mongoose = require('mongoose');
+const EventEmitter = require('events');
+const statusEmitter = new EventEmitter();
 
 // ==========================================
 // 1. ENVIRONMENT CONFIGURATION
@@ -257,7 +259,29 @@ app.post('/trigger', authenticateToken, async (req, res) => {
             });
 
             await admin.messaging().send(payload);
-            res.json({ status: 'Success', messageId });
+            
+            const getStatus = new Promise((resolve) => {
+                const timeout = setTimeout(() => {
+                    statusEmitter.removeAllListeners(messageId);
+                    resolve({ status: 'TIMEOUT' });
+                }, 10000); // 10s wait
+
+                statusEmitter.once(messageId, (result) => {
+                    clearTimeout(timeout);
+                    resolve(result);
+                });
+            });
+
+            const finalResult = await getStatus;
+            
+            if (finalResult.status === 'SUCCESS') {
+                res.json({ status: 'SUCCESS', messageId });
+            } else if (finalResult.status === 'TIMEOUT') {
+                res.json({ status: 'PENDING', messageId });
+            } else {
+                res.status(400).json({ error: finalResult.errorMessage || 'Failed to send' });
+            }
+            
         } else {
             res.status(500).json({ error: "Firebase Admin is not configured." });
         }
@@ -331,6 +355,7 @@ app.post('/status', authenticateToken, async (req, res) => {
             } else {
                 console.log(`[❌ FAILED] [${msgId}]: "${response}"`);
             }
+            statusEmitter.emit(msgId, { status: msgStatus, errorMessage: response });
         } catch(e) {
             console.error("Error updating log:", e.message);
         }
@@ -389,8 +414,26 @@ app.post('/api/sms/resend', authenticateToken, async (req, res) => {
         await SmsLog.updateOne({ messageId: log.messageId }, { status: 'PENDING', errorMessage: '' });
         await admin.messaging().send(payload);
 
+        const getStatus = new Promise((resolve) => {
+            const timeout = setTimeout(() => {
+                statusEmitter.removeAllListeners(log.messageId);
+                resolve({ status: 'TIMEOUT' });
+            }, 10000);
+
+            statusEmitter.once(log.messageId, (result) => {
+                clearTimeout(timeout);
+                resolve(result);
+            });
+        });
+
+        const finalResult = await getStatus;
+        
+        if (finalResult.status === 'FAILED') {
+            return res.status(400).json({ error: finalResult.errorMessage || 'Failed to resend' });
+        }
+
         console.log(`\n[🔄 RESENT] ${log.recipient} -> Target Mobile`);
-        res.json({ message: "Resend triggered successfully!" });
+        res.json({ message: "Resend triggered successfully!", status: finalResult.status === 'TIMEOUT' ? 'PENDING' : 'SUCCESS' });
     } catch (err) {
         res.status(500).json({ error: err.message });
     }
